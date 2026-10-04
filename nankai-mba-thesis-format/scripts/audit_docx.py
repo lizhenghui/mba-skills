@@ -100,12 +100,11 @@ def table_border(table, edge):
     return value
 
 
-def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min=None, english_reference_min=None):
+def audit(path: Path):
     findings = []
 
     def add(severity, code, message, location=None):
-        item = {"severity": severity, "code": code, "message": message,
-                "status": "候选待核对", "method": "结构预检"}
+        item = {"severity": severity, "code": code, "message": message}
         if location:
             item["location"] = location
         findings.append(item)
@@ -116,25 +115,46 @@ def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min
             if bad:
                 add("error", "DOCX_PACKAGE", f"DOCX包损坏：{bad}")
     except BadZipFile:
-        return {"file": str(path), "summary": {"findings": {"error": 1}}, "manual_checks": ["输入无效，全文检查未执行"], "findings": [{"severity": "error", "code": "DOCX_PACKAGE", "message": "不是有效的DOCX文件"}]}
+        return {"file": str(path), "findings": [{"severity": "error", "code": "DOCX_PACKAGE", "message": "不是有效的DOCX文件"}]}
 
-    try:
-        doc = Document(path)
-    except (KeyError, ValueError) as exc:
-        return {"file": str(path), "summary": {"findings": {"error": 1}}, "manual_checks": ["无法读取DOCX结构，全文检查未执行"], "findings": [{"severity": "error", "code": "DOCX_PACKAGE", "message": str(exc)}]}
+    doc = Document(path)
     paragraphs = doc.paragraphs
 
     # Page geometry.
     expected = {"width": 21.0, "height": 29.7, "top": 3.8, "bottom": 3.8,
-                "left": 3.2, "right": 3.2, "header": 3.0, "footer": 3.0, "gutter": 0.0}
+                "left": 3.2, "right": 3.2, "header": 3.0, "footer": 3.0}
     for index, section in enumerate(doc.sections, 1):
         actual = {"width": cm(section.page_width), "height": cm(section.page_height),
                   "top": cm(section.top_margin), "bottom": cm(section.bottom_margin),
                   "left": cm(section.left_margin), "right": cm(section.right_margin),
-                  "header": cm(section.header_distance), "footer": cm(section.footer_distance), "gutter": cm(section.gutter)}
+                  "header": cm(section.header_distance), "footer": cm(section.footer_distance)}
         for key, target in expected.items():
             if actual[key] is None or abs(actual[key] - target) > 0.08:
                 add("error", "PAGE_GEOMETRY", f"{key}应为{target:.1f}cm，实为{actual[key]}cm", f"第{index}节")
+
+    # Header underline (solid line below header text).
+    for index, section in enumerate(doc.sections, 1):
+        try:
+            header = section.header
+            header_paras = [p for p in header.paragraphs if p.text.strip()]
+        except Exception:
+            continue
+        if not header_paras:
+            continue
+        underlined = False
+        for p in header_paras:
+            p_pr = p._p.find(qn("w:pPr"))
+            if p_pr is None:
+                continue
+            p_bdr = p_pr.find(qn("w:pBdr"))
+            if p_bdr is None:
+                continue
+            bottom = p_bdr.find(qn("w:bottom"))
+            if bottom is not None and bottom.get(qn("w:val")) not in (None, "nil", "none"):
+                underlined = True
+                break
+        if not underlined:
+            add("warning", "HEADER_UNDERLINE", f"第{index}节页眉文字未检测到下划实线", f"第{index}节页眉")
 
     # Key style diagnostics.
     style_specs = {
@@ -154,7 +174,7 @@ def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min
             continue
         if style.font.size is not None and abs(style.font.size.pt - size) > 0.2:
             add("warning", "STYLE_SIZE", f"{name}字号应为{size}磅，实为{pt(style.font.size)}磅")
-        if heading_mode == "two" and alignment is not None and style.paragraph_format.alignment not in (None, alignment):
+        if alignment is not None and style.paragraph_format.alignment not in (None, alignment):
             add("warning", "STYLE_ALIGN", f"{name}对齐方式不符合MBA模式二")
     normal = doc.styles["Normal"]
     pf = normal.paragraph_format
@@ -164,23 +184,17 @@ def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min
     if pf.line_spacing_rule not in (None, WD_LINE_SPACING.EXACTLY):
         add("warning", "BODY_LINE_SPACING", "正文应使用固定值20磅行距")
 
-    # Semantic candidates; text alone cannot prove an outline role.
-    def is_toc(p):
-        return p.style.name.lower().startswith(("toc", "目录")) or bool(re.search(r"(?:\t|[.…·]{2,})\s*\d+\s*$", p.text))
-
     # Semantic heading hierarchy.
     chapters = []
     current_chapter = None
     current_section = None
     heading_counts = Counter()
     body_start_index = next((i for i, p in enumerate(paragraphs)
-                             if CHAPTER_RE.match(p.text.strip()) and p.style.name == "Heading 1" and not is_toc(p)), None)
+                             if CHAPTER_RE.match(p.text.strip()) and p.style.name == "Heading 1"), None)
     if body_start_index is None:
-        chapter_occurrences = [i for i, p in enumerate(paragraphs) if CHAPTER_RE.match(p.text.strip()) and not is_toc(p)]
-        body_start_index = chapter_occurrences[0] if chapter_occurrences else 0
+        chapter_occurrences = [i for i, p in enumerate(paragraphs) if CHAPTER_RE.match(p.text.strip())]
+        body_start_index = chapter_occurrences[-1] if chapter_occurrences else 0
     for index, paragraph in enumerate(paragraphs[body_start_index:], body_start_index):
-        if is_toc(paragraph):
-            continue
         text = paragraph.text.strip()
         match = CHAPTER_RE.match(text)
         level = None
@@ -209,14 +223,16 @@ def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min
         if level:
             heading_counts[f"level_{level}"] += 1
             expected_style = f"Heading {level}"
-            if heading_mode == "two" and level <= 3 and paragraph.style.name != expected_style:
+            if level <= 3 and paragraph.style.name != expected_style:
                 add("warning", "HEADING_STYLE", f"{text} 应使用 {expected_style} 或等效语义样式", f"段落{index + 1}")
             if title and TITLE_PUNCT_RE.search(title):
-                add("warning", "HEADING_PUNCTUATION", f"标题文字含标点：{text}", f"段落{index + 1}")
+                add("error", "HEADING_PUNCTUATION", f"标题文字含标点：{text}", f"段落{index + 1}")
             if not effective_keep_with_next(paragraph):
                 add("warning", "HEADING_PAGE_END", f"标题未设置与下段同页，可能落在页末：{text}", f"段落{index + 1}")
 
     for chapter in chapters:
+        if len(chapter["sections"]) < 2:
+            add("error", "CHAPTER_SECTIONS", f"{chapter['title']} 少于两节")
         for section in chapter["sections"]:
             if section["items"] == 0:
                 add("warning", "SECTION_ITEMS", f"{section['title']} 下没有“目”级标题")
@@ -241,15 +257,15 @@ def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min
         en_text = " ".join(p.text for p in paragraphs[en_idx + 1:end] if not re.match(r"^Key\s*Words", p.text.strip(), re.I))
         en_words = len(re.findall(r"\b[A-Za-z]+(?:[-'][A-Za-z]+)*\b", en_text))
         if en_words < 300:
-            add("warning", "ABSTRACT_LENGTH", f"英文摘要约{en_words}个英文词（正则估计，非实词计数），规范一般不少于300实词")
+            add("warning", "ABSTRACT_LENGTH", f"英文摘要约{en_words}个英文实词，规范建议不少于300词")
 
     keyword_lines = [(i, p.text.strip()) for i, p in enumerate(paragraphs)
                      if re.match(r"^(关键词|Key\s*Words)\s*[：:]", p.text.strip(), re.I)]
     for index, text in keyword_lines:
         payload = re.split(r"[：:]", text, maxsplit=1)[-1].strip().rstrip("；;")
         terms = [part.strip() for part in re.split(r"[；;]", payload) if part.strip()]
-        if not 3 <= len(terms) <= 5:
-            add("error", "KEYWORD_COUNT", f"关键词应为3–5个，实为{len(terms)}个", f"段落{index + 1}")
+        if not 3 <= len(terms) <= 8:
+            add("error", "KEYWORD_COUNT", f"关键词应为3–8个，实为{len(terms)}个", f"段落{index + 1}")
         if text.startswith("关键词") and ";" in payload:
             add("warning", "KEYWORD_SEPARATOR", "中文论文关键词建议统一使用中文分号", f"段落{index + 1}")
     if len(keyword_lines) < 2:
@@ -258,19 +274,17 @@ def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min
     # TOC checks.
     field_parts = [doc.element]
     for section in doc.sections:
-        field_parts.extend([section.header._element, section.footer._element, section.first_page_header._element, section.first_page_footer._element, section.even_page_header._element, section.even_page_footer._element])
+        field_parts.extend([section.header._element, section.footer._element])
     xml_text = " ".join(text for part in field_parts for text in part.xpath(".//w:instrText/text()"))
-    simple_fields = " ".join(value for part in field_parts for value in part.xpath(".//w:fldSimple/@w:instr"))
-    xml_text += " " + simple_fields
     has_toc_field = "TOC" in xml_text.upper()
     if toc_idx is None:
         add("error", "TOC_MISSING", "缺少目录标题")
     elif body_start_index is not None:
         toc_visible = [p.text.strip() for p in paragraphs[toc_idx + 1:body_start_index] if p.text.strip()]
-        if heading_mode == "two" and toc_visible and not CHAPTER_RE.match(toc_visible[0]):
+        if toc_visible and not CHAPTER_RE.match(toc_visible[0]):
             add("error", "TOC_START", f"目录应直接从第一章开始，当前首项为：{toc_visible[0][:40]}")
-        if heading_mode == "two" and toc_visible and not any(ITEM_RE.match(t) for t in toc_visible):
-            add("warning", "TOC_LEVELS", "目录可见文本未体现“目”级，需核对实际存在的章节目三级是否入目录")
+        if toc_visible and not any(ITEM_RE.match(t) for t in toc_visible):
+            add("warning", "TOC_LEVELS", "目录可见文本未体现“目”级，MBA目录应有三级")
         if not toc_visible and not has_toc_field:
             add("error", "TOC_EMPTY", "目录无可见条目且未检测到TOC域")
 
@@ -287,7 +301,7 @@ def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min
             add("warning", "FIGURE_CAPTION_POSITION", f"图题应紧接在图下方：{text}", f"段落{index + 1}")
         following = next_nonempty_paragraph(paragraphs, index, 1)
         if following is None or not SOURCE_RE.match(following.text.strip()):
-            add("warning", "FIGURE_SOURCE", f"图题后未检测到独立来源行，需核对题注/注释中的真实来源：{text}", f"段落{index + 1}")
+            add("error", "FIGURE_SOURCE", f"图后缺少资料来源：{text}", f"段落{index + 1}")
     if len(doc.inline_shapes) != len(figure_captions):
         add("warning", "FIGURE_COUNT", f"内嵌图形{len(doc.inline_shapes)}个，图题{len(figure_captions)}个，请人工核对浮动图形和图题")
     by_chapter = {}
@@ -300,12 +314,18 @@ def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min
 
     # Tables and their neighboring paragraphs.
     blocks = list(iter_blocks(doc))
+    # 前置部分的封面/题名页/声明页表格属于学校固定版式，不参与表题、来源和三线表检查
+    reached_body = body_start_index in (0, None)
+    body_start_el = None if reached_body else paragraphs[body_start_index]._p
     table_index = 0
     for index, block in enumerate(blocks):
+        if isinstance(block, Paragraph) and block._p is body_start_el:
+            reached_body = True
         if not isinstance(block, Table):
             continue
+        if not reached_body:
+            continue
         table_index += 1
-        # Only captioned tables are confidently data tables. Report other tables for semantic review.
         prev_text = ""
         next_text = ""
         for prior in reversed(blocks[:index]):
@@ -317,10 +337,9 @@ def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min
                 next_text = following.text.strip()
                 break
         if not TABLE_RE.match(prev_text):
-            add("warning", "TABLE_ROLE", f"第{table_index}个表格未识别为有题注数据表：确认是布局表还是缺题注；本表来源/边框暂未检查", f"表格{table_index}")
-            continue
+            add("error", "TABLE_CAPTION_POSITION", f"第{table_index}个表格上方缺少规范表题")
         if not SOURCE_RE.match(next_text):
-            add("warning", "TABLE_SOURCE", f"第{table_index}个表格后未检测独立来源行，需检查表注中来源")
+            add("error", "TABLE_SOURCE", f"第{table_index}个表格后缺少资料来源")
 
         top = table_border(block, "top")
         bottom = table_border(block, "bottom")
@@ -330,7 +349,7 @@ def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min
         if top in (None, "nil", "none") or bottom in (None, "nil", "none") or inside in (None, "nil", "none"):
             add("warning", "THREE_LINE_TABLE", f"第{table_index}个表格未检测到完整三线表边框")
         if any(value not in (None, "nil", "none") for value in forbidden.values()):
-            add("warning", "THREE_LINE_TABLE", f"第{table_index}个表格存在侧边或内部竖线")
+            add("error", "THREE_LINE_TABLE", f"第{table_index}个表格存在侧边或内部竖线")
         if block.rows:
             tr_pr = block.rows[0]._tr.get_or_add_trPr()
             if tr_pr.find(qn("w:tblHeader")) is None:
@@ -344,34 +363,38 @@ def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min
     else:
         end = len(paragraphs)
         for i in range(ref_idx + 1, len(paragraphs)):
-            text = paragraphs[i].text.strip()
-            if text in {"致谢", "个人简历 在学期间发表的学术论文与研究成果"} or text.startswith("附录"):
+            text = normalized_label(paragraphs[i].text.strip())
+            if text in {"致谢", "个人简历在学期间发表的学术论文与研究成果"} or text.startswith("附录"):
                 end = i
                 break
         refs = [p.text.strip() for p in paragraphs[ref_idx + 1:end] if p.text.strip()]
         body_text = "\n".join(p.text for p in paragraphs[:ref_idx])
         numeric = NUMERIC_CITATION_RE.findall(body_text)
-        if numeric and citation_system == "author-year":
+        if numeric:
             add("error", "CITATION_SYSTEM", f"正文仍含顺序编码引文，例如：{', '.join(numeric[:5])}")
-        if reference_min is not None and len(refs) < reference_min:
-            add("warning", "REFERENCE_COUNT", f"参考文献{len(refs)}篇，所选最低数量{reference_min}篇；当前按非空段落估计，需核对跨段条目")
+        if len(refs) < 30:
+            add("warning", "REFERENCE_COUNT", f"参考文献{len(refs)}篇，MBA要求不宜少于30篇")
         english = [ref for ref in refs if re.match(r"^[A-Za-z]", re.sub(r"^\[\d+\]\s*", "", ref))]
-        if english_reference_min is not None and len(english) < english_reference_min:
-            add("warning", "ENGLISH_REFERENCE_COUNT", f"英文参考文献{len(english)}篇，所选最低数量{english_reference_min}篇；语种按首字符估计，需逐条核实")
-        if citation_system == "author-year" and any(re.match(r"^\[\d+\]", ref) for ref in refs):
-            add("warning", "REFERENCE_NUMBERING", "著者—出版年制的文后条目不应保留顺序编码序号")
+        if len(english) < 5:
+            add("warning", "ENGLISH_REFERENCE_COUNT", f"英文参考文献{len(english)}篇，MBA要求不宜少于5篇")
+        if not all(re.match(r"^\[\d+\]", ref) for ref in refs):
+            add("warning", "REFERENCE_NUMBERING",
+                "文后参考文献条目应统一加方括号顺序编码，形如[1]、[2]……")
+        else:
+            nums = [int(re.match(r"^\[(\d+)\]", ref).group(1)) for ref in refs]
+            if nums != list(range(1, len(refs) + 1)):
+                add("warning", "REFERENCE_NUMBERING_ORDER",
+                    f"参考文献编号未从1连续编号：{[n for n in nums[:10]]}…共{len(nums)}条")
         seen_english = False
         for ref in refs:
             is_english = bool(re.match(r"^[A-Za-z]", re.sub(r"^\[\d+\]\s*", "", ref)))
             seen_english = seen_english or is_english
-            if citation_system == "author-year" and seen_english and not is_english:
+            if seen_english and not is_english:
                 add("error", "REFERENCE_LANGUAGE_ORDER", "中文参考文献出现在外文参考文献之后")
                 break
         theses = [ref for ref in refs if re.search(r"\[D(?:/[^\]]+)?\]", ref, re.I)]
-        if citation_system == "auto":
-            add("info", "CITATION_REVIEW", "学校允许两种制式；需人工确认全文一致、引文对应及按所选制式排序")
-        if reference_min is None:
-            add("info", "REFERENCE_THRESHOLD", "附件未给参考文献数量下限，最低量待确认；非空段落计数不是最终条目数")
+        if theses:
+            add("warning", "THESIS_REFERENCE", f"检测到{len(theses)}篇学位论文文献，MBA一般不引用学位论文")
 
     # Section page-number formats and fields.
     section_properties = doc.element.body.xpath(".//w:sectPr")
@@ -382,7 +405,7 @@ def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min
             page_formats.append({"format": pg_num.get(qn("w:fmt")), "start": pg_num.get(qn("w:start"))})
     field_counts = Counter(text.strip().split()[0].upper() for part in field_parts
                            for text in part.xpath(".//w:instrText/text()") if text.strip())
-    if not re.search(r"\bPAGE\b", xml_text, re.I):
+    if field_counts.get("PAGE", 0) == 0:
         add("error", "PAGE_FIELD", "未检测到PAGE页码域")
     if not any(item.get("format") == "upperRoman" for item in page_formats):
         add("error", "FRONT_PAGE_NUMBER", "未检测到前置部分大写罗马页码格式 upperRoman")
@@ -390,22 +413,17 @@ def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min
         add("error", "BODY_PAGE_NUMBER", "未检测到正文从1开始的阿拉伯页码设置")
 
     manual_checks = [
-        "按references/common-issues.md逐项覆盖R01–R14，未检查不得记通过。",
-        "实际正文/run格式（含继承/主题/直接覆盖）及中文字体需核对；样式预检不是实际格式判定。",
-        "摘要以1页为宜，核对中英文内容对应与实际词义；没有1页/2页绝对上限。",
-        "逐页检查短节不足一页、节下无目、标题页末、图表先文后图、来源、模糊及续表。",
-        "检查两种标题/引文制式之一是否全文统一；模式一和自定义样式需语义核对。",
-        "检查页眉与组成部分/章对应、前置罗马与正文阿拉伯页码，正文第一章右页、后章另页。",
-        "脚注按解释需要核查，不能因无脚注直接判错；文献下限无附件依据则待确认。",
-        "核对附录A/B编号、公式、目录域显示、声明和授权书、真实签名及印刷装订。",
+        "渲染后确认中文摘要不超过1页、英文摘要以1页为宜且不超过2页，并核对中英文语义对应。",
+        "逐页确认每节篇幅长于1页、除章尾外页面排满、标题不落在页末最后一行。",
+        "确认所有图片打印清晰、无水印、图中文字小于正文；地图内容另做合规审查。",
+        "核对文内著者—出版年引文与文后条目一一对应，并人工确认中文拼音/外文字母排序。",
+        "确认前置部分大写罗马页码、正文阿拉伯页码，以及第一章和各章右页起排。",
+        "提交前确认双面打印、90g白色A4纸、书脊和线装/热胶装订要求。",
     ]
 
     counts = Counter(item["severity"] for item in findings)
     return {
         "file": str(path.resolve()),
-        "scope": "候选结构预检，未渲染；14类清单尚需逐项核对",
-        "profile": {"heading_mode": heading_mode, "citation_system": citation_system,
-                    "reference_min": reference_min, "english_reference_min": english_reference_min},
         "summary": {
             "paragraphs": len(paragraphs),
             "sections": len(doc.sections),
@@ -423,69 +441,16 @@ def audit(path: Path, heading_mode="auto", citation_system="auto", reference_min
     }
 
 
-RULE_GROUPS = {
-    "R01": ("PAGE_GEOMETRY", "BODY_LINE_SPACING"),
-    "R02": ("STYLE_MISSING", "STYLE_SIZE", "STYLE_ALIGN"),
-    "R03": ("HEADING_ORDER", "SECTION_ITEMS"),
-    "R04": ("HEADING_STYLE", "HEADING_PUNCTUATION", "HEADING_PAGE_END"),
-    "R05": ("REFERENCE_NUMBERING", "REFERENCE_LANGUAGE_ORDER", "REFERENCES_MISSING"),
-    "R07": ("FIGURE_CAPTION_POSITION", "FIGURE_SOURCE", "FIGURE_COUNT", "TABLE_SOURCE", "TABLE_CAPTION_POSITION"),
-    "R08": ("THREE_LINE_TABLE", "TABLE_HEADER_REPEAT", "TABLE_ROLE"),
-    "R09": ("CITATION_SYSTEM", "CITATION_REVIEW"),
-    "R10": ("PAGE_FIELD", "FRONT_PAGE_NUMBER", "BODY_PAGE_NUMBER"),
-    "R11": ("ABSTRACT_LENGTH", "KEYWORD_SEPARATOR", "ABSTRACT_MISSING", "KEYWORDS_MISSING", "KEYWORD_COUNT"),
-    "R13": ("REFERENCE_COUNT", "ENGLISH_REFERENCE_COUNT", "REFERENCE_THRESHOLD"),
-}
-
-
-def markdown_report(report):
-    def escape(value):
-        return str(value).replace("|", "\\|").replace("\n", " ")
-    lines = ["# 论文格式问题清单（结构预检，待核对）", "",
-             f"原文件：{escape(report['file'])}", "",
-             "依据：学校2026规范及XLS Sheet2 B2:B15；具体条款见references/common-issues.md。",
-             "未渲染，页码未知；以下是候选告警，不是最终合规结论。需补齐实际值、预期值和视觉/语义证据。", "",
-             f"规则配置：{escape(report.get('profile', {}))}", "",
-             "| 问题ID | 规则/依据 | 严重程度 | 位置 | 候选问题与要求 | 状态 |",
-             "|---|---|---|---|---|---|"]
-    counts = Counter()
-    for item in report['findings']:
-        rule = next((r for r, codes in RULE_GROUPS.items() if item['code'] in codes), "R14")
-        counts[rule] += 1
-        lines.append("| " + " | ".join(escape(v) for v in [f"{rule}-{counts[rule]:03}",
-                     f"{rule} / XLS B{int(rule[1:])+1}", item['severity'],
-                     item.get('location', '全文或样式（待定位）'), item['message'], '候选待核对']) + " |")
-    if not report['findings']:
-        lines += ["", "结构预检未发现候选问题；仍须执行下面的检查。"]
-    lines += ["", "## 待补检查", ""] + [f"- {x}" for x in report.get('manual_checks', [])]
-    lines += ["", "## 14类覆盖状态", "", "| 规则 | 状态 |", "|---|---|"]
-    for i in range(1, 15):
-        rule = f"R{i:02}"
-        lines.append(f"| {rule} | {'部分检查（候选待核对）' if rule in counts else '未完成检查'} |")
-    return "\n".join(lines) + "\n"
-
-
 def main():
     parser = argparse.ArgumentParser(description="Audit a DOCX against Nankai University MBA thesis-format rules.")
     parser.add_argument("docx", type=Path)
     parser.add_argument("--json", dest="json_path", type=Path)
-    parser.add_argument("--markdown", type=Path, help="Write a human-readable candidate issue list.")
-    parser.add_argument("--heading-mode", choices=["auto", "one", "two"], default="auto")
-    parser.add_argument("--citation-system", choices=["auto", "numeric", "author-year"], default="auto")
-    parser.add_argument("--reference-min", type=int)
-    parser.add_argument("--english-reference-min", type=int)
     parser.add_argument("--strict", action="store_true", help="Return exit code 2 when error findings exist.")
     args = parser.parse_args()
     if not args.docx.exists():
         parser.error(f"file not found: {args.docx}")
 
-    outputs = [p.resolve() for p in (args.json_path, args.markdown) if p]
-    if args.docx.resolve() in outputs or len(outputs) != len(set(outputs)):
-        parser.error("Report paths must be distinct from input and from each other")
-    report = audit(args.docx, args.heading_mode, args.citation_system, args.reference_min, args.english_reference_min)
-    if args.markdown:
-        args.markdown.parent.mkdir(parents=True, exist_ok=True)
-        args.markdown.write_text(markdown_report(report), encoding="utf-8")
+    report = audit(args.docx)
     if args.json_path:
         args.json_path.parent.mkdir(parents=True, exist_ok=True)
         args.json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
